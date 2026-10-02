@@ -1,0 +1,325 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+
+// --- DEKLARASI FONT ---
+#define FONT_TITLE    &FreeSansBold12pt7b  // Header utama (RESERVOIR 1)
+#define FONT_LABEL    &FreeSansBold9pt7b   // Judul Panel (LEVEL, VOL, STATUS)
+
+// --- KALIBRASI FINE-TUNING SENSOR HW-685 (4-20mA) ---
+const int ADC_ZERO     = 5;         // Titik Nol (di udara)
+const float ADC_SLOPE  = 16.9298;   // Slope disesuaikan presisi ke aktual 114 cm
+const int SAMPLES      = 15;        // 15 sampel untuk meredam noise ADC
+
+struct Tank {
+  String name;      
+  int pin;          
+  float capacity;   // Kapasitas max (m3)
+  float maxH;       // Tinggi max fisik (cm)
+  float cm;         // Level air (cm)
+  float vol;        // Volume air (m3)
+  float lastCm;     // Catatan cm sebelumnya
+  bool isFirst;     
+  bool active;      
+  bool error;       
+};
+
+// Config: Reservoir 1 (Kapasitas 30m3 / 30,000L, Tinggi Fisik Maksimum 283.4 cm)
+Tank tanks[1] = {
+  {"RESERVOIR 1", 32, 30.0, 283.4, 0.0, 0.0, 0.0, true, true, false}
+};
+
+TFT_eSPI tft = TFT_eSPI();
+unsigned long lastSensorUpdate = 0;
+
+// --- PALET WARNA INDUSTRIAL HMI/SCADA ---
+#define COLOR_DARK_BG       0x0000 // Hitam Pekat
+#define COLOR_HEADER_BG    0x0825 // Dark Slate Blue
+#define COLOR_PANEL_BG     0x092A // Panel Blue-Gray Dark
+#define COLOR_BORDER_CYAN  0x07FF // Bright Cyan
+#define COLOR_BORDER_DIM   0x1B38 // Border Muted
+#define COLOR_CYAN_NEON    0x07FF // Bright Cyan
+#define COLOR_GREEN_NEON   0x07E0 // Bright Green
+#define COLOR_AMBER_NEON   0xFDE0 // Warning Amber
+#define COLOR_RED_NEON     0xF800 // Alarm Red
+#define COLOR_TEXT_DIM     0x8C71 // Light Gray
+#define COLOR_TEXT_WHITE   0xFFFF // Pure White
+
+// =================================================================
+// BACA SENSOR & PEMROSESAN DATA
+// =================================================================
+void updateAllSensors() {
+  if (!tanks[0].active) return;
+
+  long sumADC = 0;
+  for (int i = 0; i < SAMPLES; i++) {
+    sumADC += analogRead(tanks[0].pin);
+    delay(2); // Total delay sampling = 30ms
+  }
+  int rawADC = sumADC / SAMPLES;
+
+  // --- DETEKSI KABEL TERPUTUS / SIGNAL LOSS ---
+  if (rawADC < 2) {
+    tanks[0].cm    = 0.0;
+    tanks[0].vol   = 0.0;
+    tanks[0].error = true;  
+
+    Serial.println("[SENSOR ERROR] Signal Loss / Kabel Terputus!");
+    return;
+  }
+
+  tanks[0].error = false;
+
+  // --- PERHITUNGAN LEVEL AIR ---
+  float currentCm = 0.0;
+
+  if (rawADC > ADC_ZERO) {
+    currentCm = (float)(rawADC - ADC_ZERO) / ADC_SLOPE;
+  } else {
+    currentCm = 0.0;
+  }
+
+  if (currentCm > tanks[0].maxH) {
+    currentCm = tanks[0].maxH;
+  }
+
+  // --- FILTER HEAVY SMOOTHING (TANPA DEADBAND MENGUNCI) ---
+  if (tanks[0].isFirst) {
+    tanks[0].cm = currentCm;
+    tanks[0].lastCm = currentCm;
+    tanks[0].isFirst = false;
+  } else {
+    // Filter 90:10 meredam riak fluktuasi ADC secara halus
+    tanks[0].cm = (tanks[0].cm * 0.90) + (currentCm * 0.10);
+  }
+
+  // Hitung Volume (m3)
+  tanks[0].vol = (tanks[0].cm / 300.0) * tanks[0].capacity; 
+  if (tanks[0].vol < 0) tanks[0].vol = 0;
+
+  // --- LOG SERIAL MONITOR RINGKAS ---
+  Serial.print("Raw ADC: ");
+  Serial.print(rawADC);
+  Serial.print(" | Level Air: ");
+  Serial.print(tanks[0].cm, 1);
+  Serial.println(" cm");
+}
+
+// =================================================================
+// TAMPILAN STATIS DESAIN SCADA / HMI
+// =================================================================
+void drawStaticUI() {
+  tft.fillScreen(COLOR_DARK_BG);
+
+  // --- 1. HEADER BAR ---
+  tft.fillRect(0, 0, 480, 42, COLOR_HEADER_BG);
+  tft.drawFastHLine(0, 41, 480, COLOR_BORDER_CYAN);
+
+  // Logo Indicator & Judul Tangki
+  tft.fillCircle(18, 21, 5, COLOR_CYAN_NEON);
+  tft.setFreeFont(FONT_TITLE);
+  tft.setTextSize(1);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(COLOR_TEXT_WHITE, COLOR_HEADER_BG);
+  tft.drawString(tanks[0].name, 32, 21);
+
+  // Status Badge "ONLINE"
+  tft.fillRoundRect(360, 8, 110, 26, 13, COLOR_DARK_BG);
+  tft.drawRoundRect(360, 8, 110, 26, 13, COLOR_GREEN_NEON);
+  tft.fillCircle(374, 21, 4, COLOR_GREEN_NEON);
+  
+  tft.setTextFont(2);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(COLOR_GREEN_NEON, COLOR_DARK_BG);
+  tft.drawString("ONLINE", 386, 21);
+
+  // ===============================================================
+  // --- 2. PANEL KIRI (LEVEL KETINGGIAN AIR & PROGRESS BAR) ---
+  // ===============================================================
+  int pX = 6, pY = 48, pW = 316, pH = 264;
+  tft.fillRoundRect(pX, pY, pW, pH, 8, COLOR_PANEL_BG);
+  tft.drawRoundRect(pX, pY, pW, pH, 8, COLOR_BORDER_CYAN);
+
+  // Judul Panel Level
+  tft.setFreeFont(FONT_LABEL);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COLOR_CYAN_NEON, COLOR_PANEL_BG);
+  tft.drawString("LEVEL (cm)", pX + 14, pY + 12);
+  
+  // Sub-keterangan MAX
+  tft.setTextFont(2);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(COLOR_TEXT_DIM, COLOR_PANEL_BG);
+  tft.drawString("MAX: 300cm", pX + pW - 14, pY + 16);
+
+  // Frame Outer untuk Progress Bar
+  int barX = pX + 14;
+  int barY = pY + 205;
+  int barW = pW - 28; // 288px
+  int barH = 22;
+  
+  tft.drawRoundRect(barX, barY, barW, barH, 4, COLOR_BORDER_DIM);
+
+  // ===============================================================
+  // --- 3. PANEL KANAN (VOLUME & PERSENTASE) ---
+  // ===============================================================
+  int rX = 328, rW = 146;
+  
+  // PANEL VOLUME (KANAN ATAS)
+  int vY = 48, vH = 126;
+  tft.fillRoundRect(rX, vY, rW, vH, 8, COLOR_PANEL_BG);
+  tft.drawRoundRect(rX, vY, rW, vH, 8, COLOR_BORDER_DIM);
+  
+  tft.setFreeFont(FONT_LABEL);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COLOR_CYAN_NEON, COLOR_PANEL_BG);
+  tft.drawString("VOL (m3)", rX + 10, vY + 10);
+
+  // PANEL PERSENTASE (KANAN BAWAH)
+  int fY = 180, fH = 132;
+  tft.fillRoundRect(rX, fY, rW, fH, 8, COLOR_PANEL_BG);
+  tft.drawRoundRect(rX, fY, rW, fH, 8, COLOR_BORDER_DIM);
+
+  tft.setFreeFont(FONT_LABEL);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COLOR_GREEN_NEON, COLOR_PANEL_BG);
+  tft.drawString("LEVEL (%)", rX + 10, fY + 10);
+}
+
+// =================================================================
+// UPDATE DATA REALTIME KE LAYAR LCD
+// =================================================================
+void updateDynamicUI() {
+  float percent = (tanks[0].cm / 300.0) * 100.0;
+  if (percent > 100.0) percent = 100.0;
+  if (percent < 0.0)   percent = 0.0;
+
+  // --- 0. DYNAMIC STATUS & BAR COLOR SELECTION ---
+  uint16_t statusColor = COLOR_CYAN_NEON;
+  String statusTxt = "NORMAL";
+  
+  if (tanks[0].error) {
+    statusColor = COLOR_RED_NEON;
+    statusTxt = "ERROR";
+  } else if (tanks[0].cm >= 270.0) { 
+    statusColor = COLOR_RED_NEON;   // HIGH -> Merah
+    statusTxt = "HIGH";
+  } else if (tanks[0].cm < 50.0) { 
+    statusColor = COLOR_AMBER_NEON; // LOW -> Amber/Kuning
+    statusTxt = "LOW";
+  } else {
+    statusColor = COLOR_CYAN_NEON;  // NORMAL -> Cyan
+    statusTxt = "NORMAL";
+  }
+
+  // Update Status Badge Header
+  tft.fillRoundRect(245, 8, 95, 26, 6, COLOR_DARK_BG);
+  tft.drawRoundRect(245, 8, 95, 26, 6, statusColor);
+  tft.fillCircle(257, 21, 3, statusColor);
+  
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(statusColor, COLOR_DARK_BG);
+  tft.drawString(statusTxt, 298, 21);
+
+  // --- 1. ANGKA LEVEL UTAMA ---
+  char lvlBuf[10];
+  sprintf(lvlBuf, "%d", (int)tanks[0].cm); // Cast murni tanpa round()
+  
+  // Area refresh Y=82 (tinggi 120px) menjaga agar judul "LEVEL (cm)" tidak tertimpa
+  tft.fillRect(10, 82, 308, 120, COLOR_PANEL_BG);
+  
+  tft.setTextFont(7);            
+  tft.setTextSize(2);            
+  tft.setTextDatum(MC_DATUM); 
+  tft.setTextColor(COLOR_TEXT_WHITE, COLOR_PANEL_BG);
+  
+  // Posisi baru: X = 140 (geser kiri), Y = 155 (turun bawah)
+  tft.drawString(lvlBuf, 140, 155); 
+  tft.setTextSize(1);
+
+  // --- 2. PROGRESS BAR DINAMIS BERWARNA ---
+  int barX = 20;  
+  int barY = 253; 
+  int barW = 288;
+  int barH = 22;
+
+  int fillW = (int)((percent / 100.0) * (barW - 4));
+  if (fillW < 0) fillW = 0;
+  if (fillW > (barW - 4)) fillW = barW - 4;
+
+  // Clear area dalam bar
+  tft.fillRect(barX + 2, barY + 2, barW - 4, barH - 4, COLOR_PANEL_BG);
+  
+  // Isian bar berwarna
+  if (fillW > 0) {
+    tft.fillRect(barX + 2, barY + 2, fillW, barH - 4, statusColor);
+  }
+
+  // Text persentase kecil di bawah bar
+  tft.fillRect(barX, barY + barH + 4, barW, 20, COLOR_PANEL_BG);
+  tft.setTextFont(2);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COLOR_TEXT_DIM, COLOR_PANEL_BG);
+  
+  char barPctBuf[16];
+  sprintf(barPctBuf, "CAPACITY: %.0f%%", percent);
+  tft.drawString(barPctBuf, barX + (barW / 2), barY + barH + 12);
+
+  // --- 3. VOLUME (KANAN ATAS) ---
+  int rX = 328, rW = 146;
+  
+  tft.fillRect(rX + 2, 80, rW - 4, 90, COLOR_PANEL_BG);
+  
+  tft.setTextFont(7);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COLOR_CYAN_NEON, COLOR_PANEL_BG);
+  char volBuf[10];
+  dtostrf(tanks[0].vol, 4, 1, volBuf);
+  tft.drawString(volBuf, 401, 115); 
+
+  // --- 4. PERSENTASE LARGE (KANAN BAWAH) ---
+  tft.fillRect(rX + 2, 212, rW - 4, 90, COLOR_PANEL_BG);
+
+  tft.setTextFont(7);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COLOR_GREEN_NEON, COLOR_PANEL_BG);
+  
+  char pctLargeBuf[10];
+  dtostrf(percent, 3, 0, pctLargeBuf);
+  tft.drawString(pctLargeBuf, 401, 250); 
+}
+
+// =================================================================
+// SETUP & MAIN LOOP
+// =================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000); 
+  
+  Serial.println("\n==========================================");
+  Serial.println("  SYSTEM HMI SCADA RESERVOIR MONITORING");
+  Serial.println("  Calibrated & Stabilized Version");
+  Serial.println("==========================================");
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(tanks[0].pin, ADC_11db);
+
+  tft.init();
+  tft.setRotation(1); 
+  
+  drawStaticUI();
+  updateAllSensors();
+  updateDynamicUI();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - lastSensorUpdate >= 1000) {
+    lastSensorUpdate = currentMillis;
+    updateAllSensors();
+    updateDynamicUI();
+  }
+}
